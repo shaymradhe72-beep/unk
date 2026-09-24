@@ -21,13 +21,16 @@ import pyautogui
 import aiohttp
 
 SERVER_URL = "ws://168.144.73.133:8080/ws/agent"   # <-- put your DigitalOcean IP here
-AUTH_TOKEN = "change-this-to-a-long-random-string"  # must match server.py
+AUTH_TOKEN = "alpha123"  # must match server.py
 
 JPEG_QUALITY = 85
 CAPTURE_FPS = 15
 SCALE_FACTOR = 1.0   # must match the SCALE_FACTOR in server.py's HTML
 
 pyautogui.FAILSAFE = False  # lab machine — don't emergency-abort on corner-of-screen moves
+pyautogui.PAUSE = 0         # pyautogui defaults to sleeping 0.1s after EVERY call, which
+                            # would block the event loop and could stall the websocket
+                            # long enough to look like a dropped connection
 
 frame_queue = asyncio.Queue(maxsize=1)  # holds only the newest frame — old ones get dropped
 overlay_queue = queue.Queue()            # (thread-safe) text updates for the on-screen indicator
@@ -86,7 +89,7 @@ async def capture_loop(loop):
     ]
     frame_interval = 1.0 / CAPTURE_FPS
 
-    with mss.mss() as sct:
+    with mss.MSS() as sct:
         monitor = sct.monitors[1]
         while True:
             start = time.time()
@@ -142,12 +145,16 @@ async def send_loop(ws):
         await ws.send_bytes(data)
 
 
-async def control_loop(ws):
+async def control_loop(ws, loop):
     async for msg in ws:
         if msg.type == aiohttp.WSMsgType.TEXT:
             try:
                 cmd = json.loads(msg.data)
-                execute_command(cmd)
+                # run in executor: pyautogui calls are blocking and must never
+                # stall the event loop (that stall is what causes the false
+                # "disconnect" — video/control both freeze for a moment while
+                # the loop is stuck on a single synchronous call)
+                loop.run_in_executor(None, execute_command, cmd)
             except Exception as e:
                 print(f"[-] Bad command: {e}")
         elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -162,15 +169,22 @@ async def run():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                async with session.ws_connect(url, max_msg_size=20 * 1024 * 1024, heartbeat=20) as ws:
+                # No `heartbeat=` here — see the note in server.py for why:
+                # aiohttp's built-in ping/pong heartbeat has known races that
+                # can crash with InvalidStateError and drop the connection
+                # for no real reason. Our own reconnect loop is enough.
+                async with session.ws_connect(url, max_msg_size=20 * 1024 * 1024) as ws:
                     print("[+] Connected to relay server")
                     sender = asyncio.create_task(send_loop(ws))
-                    receiver = asyncio.create_task(control_loop(ws))
+                    receiver = asyncio.create_task(control_loop(ws, loop))
                     done, pending = await asyncio.wait(
                         [sender, receiver], return_when=asyncio.FIRST_COMPLETED
                     )
                     for task in pending:
                         task.cancel()
+                    # wait for the cancellation to actually finish before looping,
+                    # otherwise a half-cancelled task can also trigger InvalidStateError
+                    await asyncio.gather(*pending, return_exceptions=True)
                     print("[-] Disconnected from relay server")
             except Exception as e:
                 print(f"[-] Connection lost ({e}), retrying in 3s...")
@@ -178,4 +192,5 @@ async def run():
 
 
 if __name__ == "__main__":
+    threading.Thread(target=overlay_thread, daemon=True).start()
     asyncio.run(run())
