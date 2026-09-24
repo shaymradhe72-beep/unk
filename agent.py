@@ -11,6 +11,9 @@
 import asyncio
 import json
 import time
+import threading
+import queue
+import tkinter as tk
 import mss
 import numpy as np
 import cv2
@@ -18,15 +21,51 @@ import pyautogui
 import aiohttp
 
 SERVER_URL = "ws://168.144.73.133:8080/ws/agent"   # <-- put your DigitalOcean IP here
-AUTH_TOKEN = "alpha123"  # must match server.py
+AUTH_TOKEN = "change-this-to-a-long-random-string"  # must match server.py
 
-JPEG_QUALITY = 80
-CAPTURE_FPS = 12
-SCALE_FACTOR = 0.6   # must match the SCALE_FACTOR in server.py's HTML
+JPEG_QUALITY = 85
+CAPTURE_FPS = 15
+SCALE_FACTOR = 1.0   # must match the SCALE_FACTOR in server.py's HTML
 
 pyautogui.FAILSAFE = False  # lab machine — don't emergency-abort on corner-of-screen moves
 
 frame_queue = asyncio.Queue(maxsize=1)  # holds only the newest frame — old ones get dropped
+overlay_queue = queue.Queue()            # (thread-safe) text updates for the on-screen indicator
+
+
+def overlay_thread():
+    """Small always-on-top badge, top-left corner, shown while someone is
+    actively sending control commands and auto-hidden after 3s of silence."""
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    try:
+        root.attributes("-alpha", 0.85)
+    except tk.TclError:
+        pass
+    root.geometry("+20+20")
+    label = tk.Label(root, text="", bg="#c0392b", fg="white",
+                      font=("Segoe UI", 11, "bold"), padx=10, pady=6)
+    label.pack()
+    root.withdraw()
+
+    hide_job = [None]
+
+    def poll():
+        try:
+            while True:
+                text = overlay_queue.get_nowait()
+                label.config(text=text)
+                root.deiconify()
+                if hide_job[0]:
+                    root.after_cancel(hide_job[0])
+                hide_job[0] = root.after(3000, root.withdraw)
+        except queue.Empty:
+            pass
+        root.after(150, poll)
+
+    root.after(150, poll)
+    root.mainloop()
 
 
 def capture_frame(sct, monitor, encode_params):
@@ -41,7 +80,10 @@ def capture_frame(sct, monitor, encode_params):
 
 
 async def capture_loop(loop):
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    encode_params = [
+        cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY,
+        cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
+    ]
     frame_interval = 1.0 / CAPTURE_FPS
 
     with mss.mss() as sct:
@@ -75,6 +117,8 @@ KEY_MAP = {
 
 def execute_command(cmd):
     action = cmd.get("action")
+    viewer_ip = cmd.get("viewer_ip", "unknown")
+    overlay_queue.put(f"\u26a0 Controlled by {viewer_ip}")
     try:
         if action == "click":
             pyautogui.click(cmd["x"], cmd["y"], button=cmd.get("button", "left"))
