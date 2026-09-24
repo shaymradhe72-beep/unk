@@ -21,7 +21,7 @@ import pyautogui
 import aiohttp
 
 SERVER_URL = "ws://168.144.73.133:8080/ws/agent"   # <-- put your DigitalOcean IP here
-AUTH_TOKEN = "alpha123"  # must match server.py
+AUTH_TOKEN = "change-this-to-a-long-random-string"  # must match server.py
 
 JPEG_QUALITY = 85
 CAPTURE_FPS = 15
@@ -120,8 +120,6 @@ KEY_MAP = {
 
 def execute_command(cmd):
     action = cmd.get("action")
-    viewer_ip = cmd.get("viewer_ip", "unknown")
-    overlay_queue.put(f"\u26a0 Controlled by {viewer_ip}")
     try:
         if action == "click":
             pyautogui.click(cmd["x"], cmd["y"], button=cmd.get("button", "left"))
