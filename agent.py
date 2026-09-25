@@ -1,18 +1,34 @@
-# agent.py — runs on PC A (Windows, your personal PC)
-#
-# Captures the screen, streams JPEG frames to the relay server (server.py on
-# PC B) over a WebSocket, and executes mouse/keyboard commands received back
-# over that same connection.
+# agent.py — PC A (Windows) remote-screen / remote-control agent
+# =================================================================
+# Streams this machine's screen to the relay server (server.py, running on
+# PC B) over a single WebSocket, and executes mouse/keyboard commands sent
+# back over that same connection. Also supports a "black screen" privacy
+# mode — see BLACK SCREEN section below.
 #
 # Run:
 #   pip install aiohttp mss opencv-python numpy pyautogui
 #   python agent.py
+#
+# Optional: drop an agent_config.json next to this script (or the .exe) to
+# override any setting below without editing code / rebuilding. Example:
+#   {
+#     "server_url": "ws://1.2.3.4:8080/ws/agent",
+#     "auth_token": "some-long-random-string",
+#     "jpeg_quality": 85,
+#     "capture_fps": 15,
+#     "scale_factor": 1.0
+#   }
 
-import asyncio
+import sys
+import os
 import json
 import time
 import threading
 import queue
+import asyncio
+import ctypes
+from ctypes import wintypes
+
 import tkinter as tk
 import mss
 import numpy as np
@@ -20,55 +36,242 @@ import cv2
 import pyautogui
 import aiohttp
 
-SERVER_URL = "ws://168.144.73.133:8080/ws/agent"   # <-- put your DigitalOcean IP here
-AUTH_TOKEN = "change-this-to-a-long-random-string"  # must match server.py
 
-JPEG_QUALITY = 85
-CAPTURE_FPS = 15
-SCALE_FACTOR = 1.0   # must match the SCALE_FACTOR in server.py's HTML
+# ---------------------------------------------------------------------------
+# LOGGING — a PyInstaller --noconsole build has no stdout/stderr (they're
+# None). Any print() call would then crash with "'NoneType' object has no
+# attribute 'write'". Since prints sit inside exception handlers for mouse/
+# keyboard commands, that crash is exactly what makes clicks silently "stop
+# working" partway through a session. Redirect to a log file instead.
+# ---------------------------------------------------------------------------
+
+def _base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+if getattr(sys, "frozen", False) and sys.stdout is None:
+    _log_path = os.path.join(_base_dir(), "agent_log.txt")
+    _log_file = open(_log_path, "a", buffering=1, encoding="utf-8")
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+
+
+# ---------------------------------------------------------------------------
+# CONFIG — defaults below, optionally overridden by agent_config.json
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "server_url": "ws://168.144.73.133:8080/ws/agent",
+    "auth_token": "alpha123",
+    "jpeg_quality": 85,
+    "capture_fps": 15,
+    "scale_factor": 1.0,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    path = os.path.join(_base_dir(), "agent_config.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            print(f"[-] Failed to read agent_config.json, using defaults: {e}")
+    return cfg
+
+
+CONFIG = load_config()
+SERVER_URL = CONFIG["server_url"]
+AUTH_TOKEN = CONFIG["auth_token"]
+JPEG_QUALITY = CONFIG["jpeg_quality"]
+CAPTURE_FPS = CONFIG["capture_fps"]
+SCALE_FACTOR = CONFIG["scale_factor"]
 
 pyautogui.FAILSAFE = False  # lab machine — don't emergency-abort on corner-of-screen moves
-pyautogui.PAUSE = 0         # pyautogui defaults to sleeping 0.1s after EVERY call, which
-                            # would block the event loop and could stall the websocket
-                            # long enough to look like a dropped connection
-
-frame_queue = asyncio.Queue(maxsize=1)  # holds only the newest frame — old ones get dropped
-overlay_queue = queue.Queue()            # (thread-safe) text updates for the on-screen indicator
+pyautogui.PAUSE = 0         # pyautogui defaults to a 0.1s sleep after EVERY call, which
+                            # would block the event loop long enough to look like a
+                            # dropped connection — see control_loop, which also runs
+                            # every command in a background thread as a second safeguard
 
 
-def overlay_thread():
-    """Small always-on-top badge, top-left corner, shown while someone is
-    actively sending control commands and auto-hidden after 3s of silence."""
-    root = tk.Tk()
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
+# ---------------------------------------------------------------------------
+# BLACK SCREEN — privacy mode. Blanks PC A's physical display and blocks its
+# physical mouse/keyboard, while the remote viewer keeps seeing the real
+# screen and keeps full control. Two Windows tricks make this possible:
+#
+#   1. SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) on the black overlay
+#      window makes it invisible to screen-capture APIs (including mss), so
+#      the remote viewer's stream shows the real desktop right through it —
+#      while a person physically at the monitor just sees solid black.
+#
+#   2. A low-level keyboard/mouse hook blocks physical input (Windows tags
+#      it as "not injected") but explicitly lets pyautogui's synthetic
+#      ("injected") input through, so remote control keeps working.
+#
+# Safety valves, since this can block physical input on your own PC:
+#   - Holding Ctrl+Alt+Q physically forces it off immediately.
+#   - It auto-disables the moment the relay connection drops.
+#   - Ctrl+Alt+Del is handled by Windows below the hook layer and can never
+#     be blocked by this — always available to open Task Manager and kill
+#     the process as a last resort.
+#
+# Requires Windows 10 build 2004 (May 2020 Update) or later for the display-
+# affinity trick; on older Windows the overlay still blanks/blocks input,
+# but the remote stream would go black too (a warning is logged if it fails).
+# ---------------------------------------------------------------------------
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+WM_KEYUP = 0x0101
+WM_SYSKEYUP = 0x0105
+LLKHF_INJECTED = 0x10
+LLMHF_INJECTED = 0x01
+WDA_EXCLUDEFROMCAPTURE = 0x11
+
+HHOOK = wintypes.HANDLE
+WPARAM = ctypes.c_size_t
+LPARAM = ctypes.c_ssize_t
+ULONG_PTR = ctypes.c_size_t
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR)]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR)]
+
+
+LowLevelProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, WPARAM, LPARAM)
+
+user32.SetWindowsHookExW.restype = HHOOK
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, LowLevelProc, wintypes.HINSTANCE, wintypes.DWORD]
+user32.CallNextHookEx.restype = ctypes.c_long
+user32.CallNextHookEx.argtypes = [HHOOK, ctypes.c_int, WPARAM, LPARAM]
+user32.UnhookWindowsHookEx.argtypes = [HHOOK]
+user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+
+blackscreen_state = {"active": False, "window": None}
+blackscreen_queue = queue.Queue()   # thread-safe on/off requests, drained on the Tk thread
+_hook_handles = {"kb": None, "mouse": None}
+_panic_keys_down = set()
+PANIC_CTRL = {0x11, 0xA2, 0xA3}    # VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+PANIC_ALT = {0x12, 0xA4, 0xA5}     # VK_MENU, VK_LMENU, VK_RMENU
+PANIC_Q = 0x51                      # 'Q'
+
+
+def _keyboard_hook_proc(nCode, wParam, lParam):
+    if nCode == 0 and blackscreen_state["active"]:
+        kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+        if not (kb.flags & LLKHF_INJECTED):  # real physical key, not from pyautogui
+            if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                _panic_keys_down.add(kb.vkCode)
+                if (_panic_keys_down & PANIC_CTRL) and (_panic_keys_down & PANIC_ALT) \
+                        and PANIC_Q in _panic_keys_down:
+                    blackscreen_queue.put(False)  # emergency off
+            elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                _panic_keys_down.discard(kb.vkCode)
+            return 1  # swallow the physical key
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _mouse_hook_proc(nCode, wParam, lParam):
+    if nCode == 0 and blackscreen_state["active"]:
+        ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+        if not (ms.flags & LLMHF_INJECTED):  # real physical mouse, not from pyautogui
+            return 1  # swallow the physical click/move
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+_kb_proc_ref = LowLevelProc(_keyboard_hook_proc)      # keep references alive —
+_mouse_proc_ref = LowLevelProc(_mouse_hook_proc)      # GC'd callbacks would crash
+
+
+def _install_hooks():
+    hmod = kernel32.GetModuleHandleW(None)
+    _hook_handles["kb"] = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_proc_ref, hmod, 0)
+    _hook_handles["mouse"] = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_proc_ref, hmod, 0)
+
+
+def _uninstall_hooks():
+    for key in ("kb", "mouse"):
+        if _hook_handles[key]:
+            user32.UnhookWindowsHookEx(_hook_handles[key])
+            _hook_handles[key] = None
+    _panic_keys_down.clear()
+
+
+def _show_blackscreen(root):
+    win = tk.Toplevel(root)
+    win.attributes("-topmost", True)
+    win.overrideredirect(True)
+    win.configure(bg="black")
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{sw}x{sh}+0+0")
+    win.update_idletasks()
     try:
-        root.attributes("-alpha", 0.85)
-    except tk.TclError:
-        pass
-    root.geometry("+20+20")
-    label = tk.Label(root, text="", bg="#c0392b", fg="white",
-                      font=("Segoe UI", 11, "bold"), padx=10, pady=6)
-    label.pack()
-    root.withdraw()
+        user32.SetWindowDisplayAffinity(wintypes.HWND(win.winfo_id()), WDA_EXCLUDEFROMCAPTURE)
+    except Exception as e:
+        print(f"[-] SetWindowDisplayAffinity failed (needs Windows 10 2004+): {e}")
+    blackscreen_state["window"] = win
+    _install_hooks()
+    blackscreen_state["active"] = True
+    print("[*] Black screen ON — physical input blocked; Ctrl+Alt+Q forces it off")
 
-    hide_job = [None]
+
+def _hide_blackscreen():
+    blackscreen_state["active"] = False
+    _uninstall_hooks()
+    win = blackscreen_state.get("window")
+    if win is not None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        blackscreen_state["window"] = None
+    print("[*] Black screen OFF")
+
+
+def ui_thread_main():
+    """Hidden Tk root: hosts the blackscreen Toplevel and pumps the Windows
+    message loop the low-level input hooks need to fire on this thread."""
+    root = tk.Tk()
+    root.withdraw()
 
     def poll():
         try:
             while True:
-                text = overlay_queue.get_nowait()
-                label.config(text=text)
-                root.deiconify()
-                if hide_job[0]:
-                    root.after_cancel(hide_job[0])
-                hide_job[0] = root.after(3000, root.withdraw)
+                want_on = blackscreen_queue.get_nowait()
+                if want_on and not blackscreen_state["active"]:
+                    _show_blackscreen(root)
+                elif not want_on and blackscreen_state["active"]:
+                    _hide_blackscreen()
         except queue.Empty:
             pass
-        root.after(150, poll)
+        root.after(100, poll)
 
-    root.after(150, poll)
+    root.after(100, poll)
     root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# SCREEN CAPTURE
+# ---------------------------------------------------------------------------
+
+frame_queue = asyncio.Queue(maxsize=1)  # holds only the newest frame — old ones get dropped
 
 
 def capture_frame(sct, monitor, encode_params):
@@ -78,19 +281,19 @@ def capture_frame(sct, monitor, encode_params):
         h, w = img_bgr.shape[:2]
         img_bgr = cv2.resize(img_bgr, (int(w * SCALE_FACTOR), int(h * SCALE_FACTOR)),
                               interpolation=cv2.INTER_AREA)
-    ok, encoded = cv2.imencode('.jpg', img_bgr, encode_params)
+    ok, encoded = cv2.imencode(".jpg", img_bgr, encode_params)
     return encoded.tobytes() if ok else None
 
 
 async def capture_loop(loop):
     encode_params = [
         cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY,
-        cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
+        cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,  # sharper text/edges
     ]
     frame_interval = 1.0 / CAPTURE_FPS
 
     with mss.MSS() as sct:
-        monitor = sct.monitors[1]
+        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
         while True:
             start = time.time()
             # mss/cv2 are blocking — run them in a thread so we don't stall the event loop
@@ -108,7 +311,13 @@ async def capture_loop(loop):
                 await asyncio.sleep(frame_interval - elapsed)
 
 
-# Browser key names -> pyautogui key names, for the ones that differ
+# ---------------------------------------------------------------------------
+# INPUT CONTROL — mouse/keyboard commands received from the viewer
+# ---------------------------------------------------------------------------
+
+# Browser key names -> pyautogui key names, for the ones that differ.
+# Anything not listed here just gets lowercased (works for letters, digits,
+# and function keys like "F1" -> "f1").
 KEY_MAP = {
     "Enter": "enter", "Backspace": "backspace", "Tab": "tab",
     "Escape": "esc", "ArrowUp": "up", "ArrowDown": "down",
@@ -116,6 +325,9 @@ KEY_MAP = {
     "Shift": "shift", "Control": "ctrl", "Alt": "alt",
     "CapsLock": "capslock", "Delete": "delete",
 }
+
+pressed_keys = set()
+pressed_keys_lock = threading.Lock()
 
 
 def execute_command(cmd):
@@ -129,13 +341,38 @@ def execute_command(cmd):
             key = KEY_MAP.get(cmd["key"], cmd["key"].lower())
             if len(key) == 1 or key in pyautogui.KEYBOARD_KEYS:
                 pyautogui.keyDown(key)
+                with pressed_keys_lock:
+                    pressed_keys.add(key)
         elif action == "keyup":
             key = KEY_MAP.get(cmd["key"], cmd["key"].lower())
             if len(key) == 1 or key in pyautogui.KEYBOARD_KEYS:
                 pyautogui.keyUp(key)
+                with pressed_keys_lock:
+                    pressed_keys.discard(key)
+        elif action == "blackscreen":
+            blackscreen_queue.put(bool(cmd.get("state")))
     except Exception as e:
         print(f"[-] Command failed: {e}")
 
+
+def release_all_keys():
+    """Safety valve: if a keyup ever gets lost (tab loses focus mid-press, a
+    dropped message, a disconnect), a modifier like Shift/Ctrl/Alt can be
+    left 'stuck' held down — every click after that behaves oddly (e.g.
+    Ctrl+Click instead of a plain click). Call this on every disconnect."""
+    with pressed_keys_lock:
+        keys = list(pressed_keys)
+        pressed_keys.clear()
+    for k in keys:
+        try:
+            pyautogui.keyUp(k)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# NETWORKING
+# ---------------------------------------------------------------------------
 
 async def send_loop(ws):
     while True:
@@ -144,19 +381,21 @@ async def send_loop(ws):
 
 
 async def control_loop(ws, loop):
-    async for msg in ws:
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                cmd = json.loads(msg.data)
-                # run in executor: pyautogui calls are blocking and must never
-                # stall the event loop (that stall is what causes the false
-                # "disconnect" — video/control both freeze for a moment while
-                # the loop is stuck on a single synchronous call)
-                loop.run_in_executor(None, execute_command, cmd)
-            except Exception as e:
-                print(f"[-] Bad command: {e}")
-        elif msg.type == aiohttp.WSMsgType.ERROR:
-            break
+    try:
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    cmd = json.loads(msg.data)
+                    # Run in executor: pyautogui calls are blocking and must
+                    # never stall the event loop (a stall here is what can
+                    # make the connection look like it silently dropped).
+                    loop.run_in_executor(None, execute_command, cmd)
+                except Exception as e:
+                    print(f"[-] Bad command: {e}")
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                break
+    finally:
+        release_all_keys()
 
 
 async def run():
@@ -167,12 +406,18 @@ async def run():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # No `heartbeat=` here — see the note in server.py for why:
-                # aiohttp's built-in ping/pong heartbeat has known races that
-                # can crash with InvalidStateError and drop the connection
-                # for no real reason. Our own reconnect loop is enough.
+                # No `heartbeat=` — aiohttp's built-in ping/pong heartbeat has
+                # known races that can crash with InvalidStateError and drop
+                # the connection for no real reason. Our own reconnect loop,
+                # plus constant frame traffic keeping the socket alive, is
+                # enough on its own.
                 async with session.ws_connect(url, max_msg_size=20 * 1024 * 1024) as ws:
                     print("[+] Connected to relay server")
+                    # Tell the viewer what scale we're capturing at, so its
+                    # coordinate math doesn't rely on a hardcoded constant
+                    # that has to be kept in sync by hand.
+                    await ws.send_str(json.dumps({"type": "meta", "scale": SCALE_FACTOR}))
+
                     sender = asyncio.create_task(send_loop(ws))
                     receiver = asyncio.create_task(control_loop(ws, loop))
                     done, pending = await asyncio.wait(
@@ -180,15 +425,16 @@ async def run():
                     )
                     for task in pending:
                         task.cancel()
-                    # wait for the cancellation to actually finish before looping,
-                    # otherwise a half-cancelled task can also trigger InvalidStateError
+                    # Wait for cancellation to actually finish before looping —
+                    # a half-cancelled task can also trigger InvalidStateError.
                     await asyncio.gather(*pending, return_exceptions=True)
                     print("[-] Disconnected from relay server")
             except Exception as e:
                 print(f"[-] Connection lost ({e}), retrying in 3s...")
+                blackscreen_queue.put(False)  # never leave PC A blacked out if we lose the link
                 await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
-    threading.Thread(target=overlay_thread, daemon=True).start()
+    threading.Thread(target=ui_thread_main, daemon=True).start()
     asyncio.run(run())
