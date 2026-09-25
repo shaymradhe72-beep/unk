@@ -139,6 +139,10 @@ LLMHF_INJECTED = 0x01
 WDA_EXCLUDEFROMCAPTURE = 0x11
 WS_POPUP = 0x80000000
 WS_VISIBLE = 0x10000000
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020   # click-through: mouse hit-testing skips this window entirely
+WS_EX_NOACTIVATE = 0x08000000    # never steals keyboard focus when shown
+LWA_ALPHA = 0x00000002
 HWND_TOPMOST = -1
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
@@ -210,6 +214,8 @@ user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, ctypes.c_uint, ctype
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_uint]
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD]
+user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
 
 blackscreen_state = {"active": False, "hwnd": None}
 blackscreen_queue = queue.Queue()   # thread-safe on/off requests, drained by the timer below
@@ -318,8 +324,17 @@ def _show_blackscreen():
     sh = user32.GetSystemMetrics(SM_CYSCREEN)
 
     ctypes.set_last_error(0)
+    # WS_EX_LAYERED | WS_EX_TRANSPARENT: visually opaque (we paint it black),
+    # but click-through — mouse hit-testing skips it entirely. Our low-level
+    # hook already swallows PHYSICAL clicks before hit-testing ever runs, so
+    # this only affects the injected (remote/pyautogui) clicks the hook lets
+    # through — letting them land on the real window underneath instead of
+    # being captured by this overlay. WS_EX_NOACTIVATE stops it from ever
+    # taking keyboard focus, so injected keystrokes keep going to whatever
+    # app the remote controller is actually typing into.
+    ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
     hwnd = user32.CreateWindowExW(
-        0, "AgentBlackScreenClass", "BlackScreen", WS_POPUP | WS_VISIBLE,
+        ex_style, "AgentBlackScreenClass", "BlackScreen", WS_POPUP | WS_VISIBLE,
         0, 0, sw, sh, None, None, hinstance, None,
     )
     if not hwnd:
@@ -328,6 +343,7 @@ def _show_blackscreen():
               f"black screen could not be shown.")
         return
 
+    user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)  # fully opaque
     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
 
     ctypes.set_last_error(0)
