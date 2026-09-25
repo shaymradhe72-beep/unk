@@ -213,23 +213,23 @@ _mouse_proc_ref = LowLevelProc(_mouse_hook_proc)      # GC'd callbacks would cra
 
 
 def _install_hooks():
-    hmod = kernel32.GetModuleHandleW(None)
-
+    # MSDN: hMod is ignored for WH_KEYBOARD_LL / WH_MOUSE_LL — passing NULL is
+    # the documented-correct approach and is more portable than
+    # GetModuleHandleW(None), which can resolve incorrectly under some Python
+    # launcher/stub setups (observed as error 126 "module not found").
     ctypes.set_last_error(0)
-    _hook_handles["kb"] = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_proc_ref, hmod, 0)
+    _hook_handles["kb"] = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_proc_ref, None, 0)
     if not _hook_handles["kb"]:
         err = ctypes.get_last_error()
         print(f"[-] Keyboard hook FAILED to install (error {err}: {ctypes.FormatError(err)}). "
-              f"Physical keyboard will NOT be blocked. "
-              f"{'' if is_admin() else 'Try running as Administrator.'}")
+              f"Physical keyboard will NOT be blocked.")
 
     ctypes.set_last_error(0)
-    _hook_handles["mouse"] = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_proc_ref, hmod, 0)
+    _hook_handles["mouse"] = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_proc_ref, None, 0)
     if not _hook_handles["mouse"]:
         err = ctypes.get_last_error()
         print(f"[-] Mouse hook FAILED to install (error {err}: {ctypes.FormatError(err)}). "
-              f"Physical mouse will NOT be blocked. "
-              f"{'' if is_admin() else 'Try running as Administrator.'}")
+              f"Physical mouse will NOT be blocked.")
 
 
 def _uninstall_hooks():
@@ -240,26 +240,45 @@ def _uninstall_hooks():
     _panic_keys_down.clear()
 
 
+def _apply_display_affinity(win, retry=True):
+    hwnd = win.winfo_id()
+    ctypes.set_last_error(0)
+    ok = user32.SetWindowDisplayAffinity(wintypes.HWND(hwnd), WDA_EXCLUDEFROMCAPTURE)
+    if not ok:
+        err = ctypes.get_last_error()
+        if err == 87 and retry:
+            # overrideredirect can force Tk to recreate the underlying HWND;
+            # winfo_id() right after that swap can be a beat too early on some
+            # systems. One short wait + a fresh handle usually resolves it.
+            win.update()
+            time.sleep(0.05)
+            return _apply_display_affinity(win, retry=False)
+        return False, err
+    return True, 0
+
+
 def _show_blackscreen(root):
     win = tk.Toplevel(root)
-    win.attributes("-topmost", True)
     win.overrideredirect(True)
+    win.attributes("-topmost", True)
     win.configure(bg="black")
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
     win.geometry(f"{sw}x{sh}+0+0")
-    win.update_idletasks()
+    win.update()  # full update, not just update_idletasks() — ensures the real
+                  # OS-level window exists (post overrideredirect re-creation)
+                  # before we ask Windows for its handle
 
-    if not is_admin():
-        print("[-] Not running as Administrator — the black-screen hooks/display-affinity "
-              "below are likely to fail silently. Re-run elevated for this feature to work.")
-
-    ctypes.set_last_error(0)
-    ok = user32.SetWindowDisplayAffinity(wintypes.HWND(win.winfo_id()), WDA_EXCLUDEFROMCAPTURE)
+    print(f"[*] Black overlay HWND = {win.winfo_id()}")
+    ok, err = _apply_display_affinity(win)
     if not ok:
-        err = ctypes.get_last_error()
-        print(f"[-] SetWindowDisplayAffinity FAILED (error {err}: {ctypes.FormatError(err)}). "
-              f"The remote view will show black too instead of the real screen. "
-              f"Needs Windows 10 build 2004+ AND Administrator privileges.")
+        if err == 87:
+            print("[-] SetWindowDisplayAffinity FAILED (error 87: parameter is incorrect), "
+                  "even after retry. Windows 11 supports this API, so this points to something "
+                  "specific to this window/session rather than the OS version. The remote view "
+                  "will show black too while black screen is on.")
+        else:
+            print(f"[-] SetWindowDisplayAffinity FAILED (error {err}: {ctypes.FormatError(err)}). "
+                  f"The remote view will show black too instead of the real screen.")
 
     blackscreen_state["window"] = win
     _install_hooks()
