@@ -29,7 +29,6 @@ import asyncio
 import ctypes
 from ctypes import wintypes
 
-import tkinter as tk
 import mss
 import numpy as np
 import cv2
@@ -93,20 +92,23 @@ SCALE_FACTOR = CONFIG["scale_factor"]
 pyautogui.FAILSAFE = False  # lab machine — don't emergency-abort on corner-of-screen moves
 pyautogui.PAUSE = 0         # pyautogui defaults to a 0.1s sleep after EVERY call, which
                             # would block the event loop long enough to look like a
-                            # dropped connection — see control_loop, which also runs
-                            # every command in a background thread as a second safeguard
+                            # dropped connection — control_loop also runs every command
+                            # in a background thread as a second safeguard
 
 
 # ---------------------------------------------------------------------------
 # BLACK SCREEN — privacy mode. Blanks PC A's physical display and blocks its
 # physical mouse/keyboard, while the remote viewer keeps seeing the real
-# screen and keeps full control. Two Windows tricks make this possible:
+# screen and keeps full control. Built entirely with raw Win32 calls (no
+# Tkinter) — Tkinter's own window creation was found to make
+# SetWindowDisplayAffinity fail with ERROR_INVALID_PARAMETER even on
+# Windows 11, while a plain same-process Win32 window works fine.
 #
+# Two Windows tricks make this possible:
 #   1. SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) on the black overlay
 #      window makes it invisible to screen-capture APIs (including mss), so
 #      the remote viewer's stream shows the real desktop right through it —
 #      while a person physically at the monitor just sees solid black.
-#
 #   2. A low-level keyboard/mouse hook blocks physical input (Windows tags
 #      it as "not injected") but explicitly lets pyautogui's synthetic
 #      ("injected") input through, so remote control keeps working.
@@ -119,24 +121,11 @@ pyautogui.PAUSE = 0         # pyautogui defaults to a 0.1s sleep after EVERY cal
 #     the process as a last resort.
 #
 # Requires Windows 10 build 2004 (May 2020 Update) or later for the display-
-# affinity trick, AND requires this process to be running elevated (as
-# Administrator) — both SetWindowsHookExW and SetWindowDisplayAffinity fail
-# silently (return FALSE, no exception) when run as a normal user, which
-# shows up as: physical keyboard/mouse still working, and/or the remote
-# stream going black too instead of showing through. Run the script (or the
-# built .exe) as Administrator, or build with `pyinstaller --uac-admin` so
-# it always requests elevation automatically.
+# affinity trick.
 # ---------------------------------------------------------------------------
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-
-def is_admin():
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -144,9 +133,17 @@ WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
 WM_KEYUP = 0x0101
 WM_SYSKEYUP = 0x0105
+WM_TIMER = 0x0113
 LLKHF_INJECTED = 0x10
 LLMHF_INJECTED = 0x01
 WDA_EXCLUDEFROMCAPTURE = 0x11
+WS_POPUP = 0x80000000
+WS_VISIBLE = 0x10000000
+HWND_TOPMOST = -1
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
 
 HHOOK = wintypes.HANDLE
 WPARAM = ctypes.c_size_t
@@ -166,8 +163,28 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
                 ("dwExtraInfo", ULONG_PTR)]
 
 
-LowLevelProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, WPARAM, LPARAM)
+class MSG(ctypes.Structure):
+    _fields_ = [("hwnd", wintypes.HWND), ("message", ctypes.c_uint),
+                ("wParam", WPARAM), ("lParam", LPARAM),
+                ("time", wintypes.DWORD), ("pt", wintypes.POINT)]
 
+
+LowLevelProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, WPARAM, LPARAM)
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, ctypes.c_uint, WPARAM, LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+# --- argtypes/restypes (pointer-sized handles must be declared correctly,
+# especially on 64-bit, or values can get silently truncated/corrupted) ---
 user32.SetWindowsHookExW.restype = HHOOK
 user32.SetWindowsHookExW.argtypes = [ctypes.c_int, LowLevelProc, wintypes.HINSTANCE, wintypes.DWORD]
 user32.CallNextHookEx.restype = ctypes.c_long
@@ -175,14 +192,32 @@ user32.CallNextHookEx.argtypes = [HHOOK, ctypes.c_int, WPARAM, LPARAM]
 user32.UnhookWindowsHookEx.argtypes = [HHOOK]
 user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
 user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.RegisterClassW.restype = wintypes.ATOM
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+]
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DefWindowProcW.argtypes = [wintypes.HWND, ctypes.c_uint, WPARAM, LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_long
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, ctypes.c_uint, ctypes.c_uint]
+user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, ctypes.c_uint, ctypes.c_void_p]
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 
-blackscreen_state = {"active": False, "window": None}
-blackscreen_queue = queue.Queue()   # thread-safe on/off requests, drained on the Tk thread
+blackscreen_state = {"active": False, "hwnd": None}
+blackscreen_queue = queue.Queue()   # thread-safe on/off requests, drained by the timer below
 _hook_handles = {"kb": None, "mouse": None}
 _panic_keys_down = set()
 PANIC_CTRL = {0x11, 0xA2, 0xA3}    # VK_CONTROL, VK_LCONTROL, VK_RCONTROL
 PANIC_ALT = {0x12, 0xA4, 0xA5}     # VK_MENU, VK_LMENU, VK_RMENU
-PANIC_Q = 0x51                      # 'Q'
+PANIC_Q = 0x51                       # 'Q'
 
 
 def _keyboard_hook_proc(nCode, wParam, lParam):
@@ -214,9 +249,8 @@ _mouse_proc_ref = LowLevelProc(_mouse_hook_proc)      # GC'd callbacks would cra
 
 def _install_hooks():
     # MSDN: hMod is ignored for WH_KEYBOARD_LL / WH_MOUSE_LL — passing NULL is
-    # the documented-correct approach and is more portable than
-    # GetModuleHandleW(None), which can resolve incorrectly under some Python
-    # launcher/stub setups (observed as error 126 "module not found").
+    # the documented-correct approach (GetModuleHandleW(None) was observed to
+    # fail with error 126 "module not found" under some Python launcher setups).
     ctypes.set_last_error(0)
     _hook_handles["kb"] = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_proc_ref, None, 0)
     if not _hook_handles["kb"]:
@@ -240,47 +274,70 @@ def _uninstall_hooks():
     _panic_keys_down.clear()
 
 
-def _apply_display_affinity(win, retry=True):
-    hwnd = win.winfo_id()
+_wndclass_atom = None
+_wndproc_ref = None  # keep alive — a GC'd callback here would crash on the next message
+
+
+def _black_wndproc(hwnd, msg, wparam, lparam):
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def _ensure_window_class(hinstance):
+    global _wndclass_atom, _wndproc_ref
+    if _wndclass_atom is not None:
+        return
+    _wndproc_ref = WNDPROC(_black_wndproc)
+    wc = WNDCLASSW()
+    wc.style = 0
+    wc.lpfnWndProc = _wndproc_ref
+    wc.cbClsExtra = 0
+    wc.cbWndExtra = 0
+    wc.hInstance = hinstance
+    wc.hIcon = None
+    wc.hCursor = None
+    # GetStockObject(BLACK_BRUSH) gives a guaranteed solid black background
+    # for the window class, so it paints black with no custom WM_PAINT code.
+    GetStockObject = ctypes.WinDLL("gdi32", use_last_error=True).GetStockObject
+    GetStockObject.restype = wintypes.HBRUSH
+    BLACK_BRUSH = 4
+    wc.hbrBackground = GetStockObject(BLACK_BRUSH)
+    wc.lpszMenuName = None
+    wc.lpszClassName = "AgentBlackScreenClass"
+    atom = user32.RegisterClassW(ctypes.byref(wc))
+    if not atom:
+        err = ctypes.get_last_error()
+        print(f"[-] RegisterClassW failed (error {err}: {ctypes.FormatError(err)})")
+    _wndclass_atom = atom
+
+
+def _show_blackscreen():
+    hinstance = kernel32.GetModuleHandleW(None)
+    _ensure_window_class(hinstance)
+
+    sw = user32.GetSystemMetrics(SM_CXSCREEN)
+    sh = user32.GetSystemMetrics(SM_CYSCREEN)
+
     ctypes.set_last_error(0)
-    ok = user32.SetWindowDisplayAffinity(wintypes.HWND(hwnd), WDA_EXCLUDEFROMCAPTURE)
+    hwnd = user32.CreateWindowExW(
+        0, "AgentBlackScreenClass", "BlackScreen", WS_POPUP | WS_VISIBLE,
+        0, 0, sw, sh, None, None, hinstance, None,
+    )
+    if not hwnd:
+        err = ctypes.get_last_error()
+        print(f"[-] CreateWindowExW failed (error {err}: {ctypes.FormatError(err)}) — "
+              f"black screen could not be shown.")
+        return
+
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+
+    ctypes.set_last_error(0)
+    ok = user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
     if not ok:
         err = ctypes.get_last_error()
-        if err == 87 and retry:
-            # overrideredirect can force Tk to recreate the underlying HWND;
-            # winfo_id() right after that swap can be a beat too early on some
-            # systems. One short wait + a fresh handle usually resolves it.
-            win.update()
-            time.sleep(0.05)
-            return _apply_display_affinity(win, retry=False)
-        return False, err
-    return True, 0
+        print(f"[-] SetWindowDisplayAffinity FAILED (error {err}: {ctypes.FormatError(err)}). "
+              f"The remote view will show black too instead of the real screen.")
 
-
-def _show_blackscreen(root):
-    win = tk.Toplevel(root)
-    win.overrideredirect(True)
-    win.attributes("-topmost", True)
-    win.configure(bg="black")
-    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    win.geometry(f"{sw}x{sh}+0+0")
-    win.update()  # full update, not just update_idletasks() — ensures the real
-                  # OS-level window exists (post overrideredirect re-creation)
-                  # before we ask Windows for its handle
-
-    print(f"[*] Black overlay HWND = {win.winfo_id()}")
-    ok, err = _apply_display_affinity(win)
-    if not ok:
-        if err == 87:
-            print("[-] SetWindowDisplayAffinity FAILED (error 87: parameter is incorrect), "
-                  "even after retry. Windows 11 supports this API, so this points to something "
-                  "specific to this window/session rather than the OS version. The remote view "
-                  "will show black too while black screen is on.")
-        else:
-            print(f"[-] SetWindowDisplayAffinity FAILED (error {err}: {ctypes.FormatError(err)}). "
-                  f"The remote view will show black too instead of the real screen.")
-
-    blackscreen_state["window"] = win
+    blackscreen_state["hwnd"] = hwnd
     _install_hooks()
     blackscreen_state["active"] = True
     print("[*] Black screen ON — physical input blocked; Ctrl+Alt+Q forces it off")
@@ -289,36 +346,39 @@ def _show_blackscreen(root):
 def _hide_blackscreen():
     blackscreen_state["active"] = False
     _uninstall_hooks()
-    win = blackscreen_state.get("window")
-    if win is not None:
-        try:
-            win.destroy()
-        except Exception:
-            pass
-        blackscreen_state["window"] = None
+    hwnd = blackscreen_state.get("hwnd")
+    if hwnd:
+        user32.DestroyWindow(hwnd)
+        blackscreen_state["hwnd"] = None
     print("[*] Black screen OFF")
 
 
 def ui_thread_main():
-    """Hidden Tk root: hosts the blackscreen Toplevel and pumps the Windows
-    message loop the low-level input hooks need to fire on this thread."""
-    root = tk.Tk()
-    root.withdraw()
+    """Runs a native Win32 message loop on its own thread (no Tkinter) —
+    needed so the low-level input hooks have a message pump on the thread
+    that installed them, and so the black overlay window (also raw Win32)
+    gets its messages dispatched. A repeating timer wakes the loop every
+    100ms to drain blackscreen_queue without needing cross-thread posts."""
+    TIMER_ID = 1
+    user32.SetTimer(None, TIMER_ID, 100, None)
 
-    def poll():
-        try:
-            while True:
-                want_on = blackscreen_queue.get_nowait()
-                if want_on and not blackscreen_state["active"]:
-                    _show_blackscreen(root)
-                elif not want_on and blackscreen_state["active"]:
-                    _hide_blackscreen()
-        except queue.Empty:
-            pass
-        root.after(100, poll)
-
-    root.after(100, poll)
-    root.mainloop()
+    msg = MSG()
+    while True:
+        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if ret == 0:
+            break
+        if msg.message == WM_TIMER:
+            try:
+                while True:
+                    want_on = blackscreen_queue.get_nowait()
+                    if want_on and not blackscreen_state["active"]:
+                        _show_blackscreen()
+                    elif not want_on and blackscreen_state["active"]:
+                        _hide_blackscreen()
+            except queue.Empty:
+                pass
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
 
 
 # ---------------------------------------------------------------------------
